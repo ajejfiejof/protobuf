@@ -508,6 +508,7 @@ void WriteLengthDelimited(uint32_t num, absl::string_view val, std::string* s) {
 
 std::pair<const char*, uint32_t> VarintParseSlow32(const char* p,
                                                    uint32_t res) {
+#if defined(ABSL_IS_LITTLE_ENDIAN) && !defined(PROTOBUF_DISABLE_LITTLE_ENDIAN_OPT_FOR_TEST)
   uint64_t first8;
   std::memcpy(&first8, p, sizeof(first8));
 
@@ -546,10 +547,27 @@ std::pair<const char*, uint32_t> VarintParseSlow32(const char* p,
     return {p + 10, static_cast<uint32_t>(v)};
   }
   return {nullptr, 0};
+#else
+  for (std::uint32_t i = 1; i < 5; i++) {
+    uint32_t byte = static_cast<uint8_t>(p[i]);
+    res += (byte - 1) << (7 * i);
+    if (ABSL_PREDICT_TRUE(byte < 128)) {
+      return {p + i + 1, res};
+    }
+  }
+  for (std::uint32_t i = 5; i < 10; i++) {
+    uint32_t byte = static_cast<uint8_t>(p[i]);
+    if (ABSL_PREDICT_TRUE(byte < 128)) {
+      return {p + i + 1, res};
+    }
+  }
+  return {nullptr, 0};
+#endif
 }
 
 std::pair<const char*, uint64_t> VarintParseSlow64(const char* p,
                                                    uint32_t res32) {
+#if defined(ABSL_IS_LITTLE_ENDIAN) && !defined(PROTOBUF_DISABLE_LITTLE_ENDIAN_OPT_FOR_TEST)
   uint64_t first8;
   std::memcpy(&first8, p, sizeof(first8));
 
@@ -588,6 +606,17 @@ std::pair<const char*, uint64_t> VarintParseSlow64(const char* p,
     return {p + 10, v};
   }
   return {nullptr, 0};
+#else
+  uint64_t res = res32;
+  for (std::uint32_t i = 1; i < 10; i++) {
+    uint64_t byte = static_cast<uint8_t>(p[i]);
+    res += (byte - 1) << (7 * i);
+    if (ABSL_PREDICT_TRUE(byte < 128)) {
+      return {p + i + 1, res};
+    }
+  }
+  return {nullptr, 0};
+#endif
 }
 
 std::pair<const char*, uint32_t> ReadTagFallback(const char* p, uint32_t res) {

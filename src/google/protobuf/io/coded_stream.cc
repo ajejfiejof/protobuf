@@ -436,6 +436,7 @@ inline ::std::pair<bool, const uint8_t*> ReadVarint32FromArray(
   ABSL_DCHECK_EQ(*buffer, first_byte);
   ABSL_DCHECK_EQ(first_byte & 0x80, 0x80) << first_byte;
 
+#if defined(ABSL_IS_LITTLE_ENDIAN) && !defined(PROTOBUF_DISABLE_LITTLE_ENDIAN_OPT_FOR_TEST)
   uint64_t first8;
   std::memcpy(&first8, buffer, sizeof(first8));
 
@@ -471,6 +472,37 @@ inline ::std::pair<bool, const uint8_t*> ReadVarint32FromArray(
     // Overrun maximum size of a varint (10 bytes). Corrupt data.
     return std::make_pair(false, buffer + 11);
   }
+#else
+  const uint8_t* ptr = buffer;
+  uint32_t b;
+  uint32_t result = first_byte - 0x80;
+  ++ptr;
+  b = *(ptr++);
+  result += b << 7;
+  if (!(b & 0x80)) goto done;
+  result -= 0x80 << 7;
+  b = *(ptr++);
+  result += b << 14;
+  if (!(b & 0x80)) goto done;
+  result -= 0x80 << 14;
+  b = *(ptr++);
+  result += b << 21;
+  if (!(b & 0x80)) goto done;
+  result -= 0x80 << 21;
+  b = *(ptr++);
+  result += b << 28;
+  if (!(b & 0x80)) goto done;
+
+  for (int i = 0; i < kMaxVarintBytes - kMaxVarint32Bytes; i++) {
+    b = *(ptr++);
+    if (!(b & 0x80)) goto done;
+  }
+  return std::make_pair(false, ptr);
+
+done:
+  *value = result;
+  return std::make_pair(true, ptr);
+#endif
 }
 
 PROTOBUF_ALWAYS_INLINE::std::pair<bool, const uint8_t*> ReadVarint64FromArray(
@@ -480,6 +512,7 @@ inline ::std::pair<bool, const uint8_t*> ReadVarint64FromArray(
   // Assumes varint64 is at least 2 bytes.
   ABSL_DCHECK_GE(buffer[0], 128);
 
+#if defined(ABSL_IS_LITTLE_ENDIAN) && !defined(PROTOBUF_DISABLE_LITTLE_ENDIAN_OPT_FOR_TEST)
   uint64_t first8;
   std::memcpy(&first8, buffer, sizeof(first8));
 
@@ -510,6 +543,31 @@ inline ::std::pair<bool, const uint8_t*> ReadVarint64FromArray(
     // Overrun maximum size of a varint (10 bytes). Corrupt data.
     return std::make_pair(false, buffer + 11);
   }
+#else
+  const uint8_t* next;
+  if (buffer[1] < 128) {
+    next = DecodeVarint64KnownSize<2>(buffer, value);
+  } else if (buffer[2] < 128) {
+    next = DecodeVarint64KnownSize<3>(buffer, value);
+  } else if (buffer[3] < 128) {
+    next = DecodeVarint64KnownSize<4>(buffer, value);
+  } else if (buffer[4] < 128) {
+    next = DecodeVarint64KnownSize<5>(buffer, value);
+  } else if (buffer[5] < 128) {
+    next = DecodeVarint64KnownSize<6>(buffer, value);
+  } else if (buffer[6] < 128) {
+    next = DecodeVarint64KnownSize<7>(buffer, value);
+  } else if (buffer[7] < 128) {
+    next = DecodeVarint64KnownSize<8>(buffer, value);
+  } else if (buffer[8] < 128) {
+    next = DecodeVarint64KnownSize<9>(buffer, value);
+  } else if (buffer[9] < 128) {
+    next = DecodeVarint64KnownSize<10>(buffer, value);
+  } else {
+    return std::make_pair(false, buffer + 11);
+  }
+  return std::make_pair(true, next);
+#endif
 }
 
 }  // namespace

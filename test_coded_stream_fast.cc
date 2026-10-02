@@ -129,7 +129,8 @@ void TestBufferBoundaries() {
     else if (size == 3) test_val = 70000;
     else if (size == 4) test_val = 10000000;
     else if (size == 5) test_val = 2000000000ULL;
-    else test_val = 1ULL << (7 * (size - 1));
+    else if (size <= 9) test_val = 1ULL << (7 * (size - 1));
+    else test_val = 0xffffffffffffffffULL;
 
     uint8_t buf[16] = {};
     int len = EncodeVarint(test_val, buf);
