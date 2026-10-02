@@ -32,6 +32,7 @@
 #include "absl/base/optimization.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
+#include "absl/numeric/bits.h"
 #include "absl/strings/cord.h"
 #include "absl/strings/internal/resize_uninitialized.h"
 #include "absl/strings/string_view.h"
@@ -39,6 +40,9 @@
 #include "google/protobuf/io/zero_copy_stream.h"
 #include "google/protobuf/io/zero_copy_stream_impl_lite.h"
 
+#if defined(__BMI2__)
+#include <immintrin.h>
+#endif
 
 // Must be included last.
 #include "google/protobuf/port_def.inc"
@@ -429,45 +433,44 @@ PROTOBUF_ALWAYS_INLINE
                                                         uint32_t* value);
 inline ::std::pair<bool, const uint8_t*> ReadVarint32FromArray(
     uint32_t first_byte, const uint8_t* buffer, uint32_t* value) {
-  // Fast path:  We have enough bytes left in the buffer to guarantee that
-  // this read won't cross the end, so we can skip the checks.
   ABSL_DCHECK_EQ(*buffer, first_byte);
   ABSL_DCHECK_EQ(first_byte & 0x80, 0x80) << first_byte;
-  const uint8_t* ptr = buffer;
-  uint32_t b;
-  uint32_t result = first_byte - 0x80;
-  ++ptr;  // We just processed the first byte.  Move on to the second.
-  b = *(ptr++);
-  result += b << 7;
-  if (!(b & 0x80)) goto done;
-  result -= 0x80 << 7;
-  b = *(ptr++);
-  result += b << 14;
-  if (!(b & 0x80)) goto done;
-  result -= 0x80 << 14;
-  b = *(ptr++);
-  result += b << 21;
-  if (!(b & 0x80)) goto done;
-  result -= 0x80 << 21;
-  b = *(ptr++);
-  result += b << 28;
-  if (!(b & 0x80)) goto done;
-  // "result -= 0x80 << 28" is irrelevant.
 
-  // If the input is larger than 32 bits, we still need to read it all
-  // and discard the high-order bits.
-  for (int i = 0; i < kMaxVarintBytes - kMaxVarint32Bytes; i++) {
-    b = *(ptr++);
-    if (!(b & 0x80)) goto done;
+  uint64_t first8;
+  std::memcpy(&first8, buffer, sizeof(first8));
+
+  // High-bit mask: bit 7 of byte i is 1 iff byte i terminates the varint (MSB == 0).
+  uint64_t term_mask = (~first8) & 0x8080808080808080ULL;
+  if (ABSL_PREDICT_TRUE(term_mask != 0)) {
+    int ctz = absl::countr_zero(term_mask);
+    int len = (ctz >> 3) + 1;
+#if defined(__BMI2__)
+    uint64_t payload = _pext_u64(first8, 0x7f7f7f7f7f7f7f7fULL);
+    *value = static_cast<uint32_t>(_bzhi_u64(payload, 7 * len));
+#else
+    uint64_t step1 = (first8 & 0x007f007f007f007fULL) | ((first8 & 0x7f007f007f007f00ULL) >> 1);
+    uint64_t step2 = (step1 & 0x00003fff00003fffULL) | ((step1 & 0x3fff00003fff0000ULL) >> 2);
+    uint64_t step3 = (step2 & 0x0fffffffULL) | ((step2 >> 4) & (0x0fffffffULL << 28));
+    uint64_t mask = (len == 8) ? ~0ULL : ((1ULL << (7 * len)) - 1);
+    *value = static_cast<uint32_t>(step3 & mask);
+#endif
+    return std::make_pair(true, buffer + len);
   }
 
-  // We have overrun the maximum size of a varint (10 bytes).  Assume
-  // the data is corrupt.
-  return std::make_pair(false, ptr);
-
-done:
-  *value = result;
-  return std::make_pair(true, ptr);
+  // If the input is larger than 8 bytes, read 9 or 10 bytes and discard higher bits.
+  uint64_t val64;
+  if (buffer[8] < 128) {
+    auto next = DecodeVarint64KnownSize<9>(buffer, &val64);
+    *value = static_cast<uint32_t>(val64);
+    return std::make_pair(true, next);
+  } else if (buffer[9] < 128) {
+    auto next = DecodeVarint64KnownSize<10>(buffer, &val64);
+    *value = static_cast<uint32_t>(val64);
+    return std::make_pair(true, next);
+  } else {
+    // Overrun maximum size of a varint (10 bytes). Corrupt data.
+    return std::make_pair(false, buffer + 11);
+  }
 }
 
 PROTOBUF_ALWAYS_INLINE::std::pair<bool, const uint8_t*> ReadVarint64FromArray(
@@ -477,32 +480,36 @@ inline ::std::pair<bool, const uint8_t*> ReadVarint64FromArray(
   // Assumes varint64 is at least 2 bytes.
   ABSL_DCHECK_GE(buffer[0], 128);
 
-  const uint8_t* next;
-  if (buffer[1] < 128) {
-    next = DecodeVarint64KnownSize<2>(buffer, value);
-  } else if (buffer[2] < 128) {
-    next = DecodeVarint64KnownSize<3>(buffer, value);
-  } else if (buffer[3] < 128) {
-    next = DecodeVarint64KnownSize<4>(buffer, value);
-  } else if (buffer[4] < 128) {
-    next = DecodeVarint64KnownSize<5>(buffer, value);
-  } else if (buffer[5] < 128) {
-    next = DecodeVarint64KnownSize<6>(buffer, value);
-  } else if (buffer[6] < 128) {
-    next = DecodeVarint64KnownSize<7>(buffer, value);
-  } else if (buffer[7] < 128) {
-    next = DecodeVarint64KnownSize<8>(buffer, value);
-  } else if (buffer[8] < 128) {
-    next = DecodeVarint64KnownSize<9>(buffer, value);
-  } else if (buffer[9] < 128) {
-    next = DecodeVarint64KnownSize<10>(buffer, value);
-  } else {
-    // We have overrun the maximum size of a varint (10 bytes). Assume
-    // the data is corrupt.
-    return std::make_pair(false, buffer + 11);
+  uint64_t first8;
+  std::memcpy(&first8, buffer, sizeof(first8));
+
+  // High-bit mask: bit 7 of byte i is 1 iff byte i terminates the varint (MSB == 0).
+  uint64_t term_mask = (~first8) & 0x8080808080808080ULL;
+  if (ABSL_PREDICT_TRUE(term_mask != 0)) {
+    int ctz = absl::countr_zero(term_mask);
+    int len = (ctz >> 3) + 1;
+#if defined(__BMI2__)
+    uint64_t payload = _pext_u64(first8, 0x7f7f7f7f7f7f7f7fULL);
+    *value = _bzhi_u64(payload, 7 * len);
+#else
+    uint64_t step1 = (first8 & 0x007f007f007f007fULL) | ((first8 & 0x7f007f007f007f00ULL) >> 1);
+    uint64_t step2 = (step1 & 0x00003fff00003fffULL) | ((step1 & 0x3fff00003fff0000ULL) >> 2);
+    uint64_t step3 = (step2 & 0x0fffffffULL) | ((step2 >> 4) & (0x0fffffffULL << 28));
+    uint64_t mask = (len == 8) ? ~0ULL : ((1ULL << (7 * len)) - 1);
+    *value = step3 & mask;
+#endif
+    return std::make_pair(true, buffer + len);
   }
 
-  return std::make_pair(true, next);
+  // > 8 bytes (9 or 10 bytes) - rare path (< 0.01% in production workloads)
+  if (buffer[8] < 128) {
+    return std::make_pair(true, DecodeVarint64KnownSize<9>(buffer, value));
+  } else if (buffer[9] < 128) {
+    return std::make_pair(true, DecodeVarint64KnownSize<10>(buffer, value));
+  } else {
+    // Overrun maximum size of a varint (10 bytes). Corrupt data.
+    return std::make_pair(false, buffer + 11);
+  }
 }
 
 }  // namespace
@@ -516,10 +523,7 @@ bool CodedInputStream::ReadVarint32Slow(uint32_t* value) {
 }
 
 int64_t CodedInputStream::ReadVarint32Fallback(uint32_t first_byte_or_zero) {
-  if (BufferSize() >= kMaxVarintBytes ||
-      // Optimization:  We're also safe if the buffer is non-empty and it ends
-      // with a byte that would terminate a varint.
-      (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80))) {
+  if (BufferSize() >= kMaxVarintBytes) {
     ABSL_DCHECK_NE(first_byte_or_zero, 0)
         << "Caller should provide us with *buffer_ when buffer is non-empty";
     uint32_t temp;
@@ -527,6 +531,18 @@ int64_t CodedInputStream::ReadVarint32Fallback(uint32_t first_byte_or_zero) {
         ReadVarint32FromArray(first_byte_or_zero, buffer_, &temp);
     if (!p.first) return -1;
     buffer_ = p.second;
+    return temp;
+  } else if (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80)) {
+    ABSL_DCHECK_NE(first_byte_or_zero, 0)
+        << "Caller should provide us with *buffer_ when buffer is non-empty";
+    uint8_t padded[16] = {};
+    int rem = BufferSize();
+    std::memcpy(padded, buffer_, rem);
+    uint32_t temp;
+    ::std::pair<bool, const uint8_t*> p =
+        ReadVarint32FromArray(first_byte_or_zero, padded, &temp);
+    if (!p.first) return -1;
+    buffer_ += (p.second - padded);
     return temp;
   } else {
     // Really slow case: we will incur the cost of an extra function call here,
@@ -546,14 +562,20 @@ int CodedInputStream::ReadVarintSizeAsIntSlow() {
 }
 
 int CodedInputStream::ReadVarintSizeAsIntFallback() {
-  if (BufferSize() >= kMaxVarintBytes ||
-      // Optimization:  We're also safe if the buffer is non-empty and it ends
-      // with a byte that would terminate a varint.
-      (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80))) {
+  if (BufferSize() >= kMaxVarintBytes) {
     uint64_t temp;
     ::std::pair<bool, const uint8_t*> p = ReadVarint64FromArray(buffer_, &temp);
     if (!p.first || temp > static_cast<uint64_t>(INT_MAX)) return -1;
     buffer_ = p.second;
+    return temp;
+  } else if (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80)) {
+    uint8_t padded[16] = {};
+    int rem = BufferSize();
+    std::memcpy(padded, buffer_, rem);
+    uint64_t temp;
+    ::std::pair<bool, const uint8_t*> p = ReadVarint64FromArray(padded, &temp);
+    if (!p.first || temp > static_cast<uint64_t>(INT_MAX)) return -1;
+    buffer_ += (p.second - padded);
     return temp;
   } else {
     // Really slow case: we will incur the cost of an extra function call here,
@@ -591,10 +613,7 @@ uint32_t CodedInputStream::ReadTagSlow() {
 
 uint32_t CodedInputStream::ReadTagFallback(uint32_t first_byte_or_zero) {
   const int buf_size = BufferSize();
-  if (buf_size >= kMaxVarintBytes ||
-      // Optimization:  We're also safe if the buffer is non-empty and it ends
-      // with a byte that would terminate a varint.
-      (buf_size > 0 && !(buffer_end_[-1] & 0x80))) {
+  if (buf_size >= kMaxVarintBytes) {
     ABSL_DCHECK_EQ(first_byte_or_zero, buffer_[0]);
     if (first_byte_or_zero == 0) {
       ++buffer_;
@@ -607,6 +626,22 @@ uint32_t CodedInputStream::ReadTagFallback(uint32_t first_byte_or_zero) {
       return 0;
     }
     buffer_ = p.second;
+    return tag;
+  } else if (buf_size > 0 && !(buffer_end_[-1] & 0x80)) {
+    ABSL_DCHECK_EQ(first_byte_or_zero, buffer_[0]);
+    if (first_byte_or_zero == 0) {
+      ++buffer_;
+      return 0;
+    }
+    uint8_t padded[16] = {};
+    std::memcpy(padded, buffer_, buf_size);
+    uint32_t tag;
+    ::std::pair<bool, const uint8_t*> p =
+        ReadVarint32FromArray(first_byte_or_zero, padded, &tag);
+    if (!p.first) {
+      return 0;
+    }
+    buffer_ += (p.second - padded);
     return tag;
   } else {
     // We are commonly at a limit when attempting to read tags. Try to quickly
@@ -656,16 +691,24 @@ bool CodedInputStream::ReadVarint64Slow(uint64_t* value) {
 }
 
 std::pair<uint64_t, bool> CodedInputStream::ReadVarint64Fallback() {
-  if (BufferSize() >= kMaxVarintBytes ||
-      // Optimization:  We're also safe if the buffer is non-empty and it ends
-      // with a byte that would terminate a varint.
-      (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80))) {
+  if (BufferSize() >= kMaxVarintBytes) {
     uint64_t temp;
     ::std::pair<bool, const uint8_t*> p = ReadVarint64FromArray(buffer_, &temp);
     if (!p.first) {
       return std::make_pair(0, false);
     }
     buffer_ = p.second;
+    return std::make_pair(temp, true);
+  } else if (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80)) {
+    uint8_t padded[16] = {};
+    int rem = BufferSize();
+    std::memcpy(padded, buffer_, rem);
+    uint64_t temp;
+    ::std::pair<bool, const uint8_t*> p = ReadVarint64FromArray(padded, &temp);
+    if (!p.first) {
+      return std::make_pair(0, false);
+    }
+    buffer_ += (p.second - padded);
     return std::make_pair(temp, true);
   } else {
     uint64_t temp;

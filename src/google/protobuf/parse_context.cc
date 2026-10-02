@@ -33,6 +33,10 @@
 #include "utf8_validity.h"
 
 
+#if defined(__BMI2__)
+#include <immintrin.h>
+#endif
+
 // Must be included last.
 #include "google/protobuf/port_def.inc"
 
@@ -504,32 +508,84 @@ void WriteLengthDelimited(uint32_t num, absl::string_view val, std::string* s) {
 
 std::pair<const char*, uint32_t> VarintParseSlow32(const char* p,
                                                    uint32_t res) {
-  for (std::uint32_t i = 1; i < 5; i++) {
-    uint32_t byte = static_cast<uint8_t>(p[i]);
-    res += (byte - 1) << (7 * i);
-    if (ABSL_PREDICT_TRUE(byte < 128)) {
-      return {p + i + 1, res};
-    }
+  uint64_t first8;
+  std::memcpy(&first8, p, sizeof(first8));
+
+  uint64_t term_mask = (~first8) & 0x8080808080808080ULL;
+  if (ABSL_PREDICT_TRUE(term_mask != 0)) {
+    int ctz = absl::countr_zero(term_mask);
+    int len = (ctz >> 3) + 1;
+#if defined(__BMI2__)
+    uint64_t payload = _pext_u64(first8, 0x7f7f7f7f7f7f7f7fULL);
+    uint32_t val = static_cast<uint32_t>(_bzhi_u64(payload, 7 * len));
+#else
+    uint64_t step1 = (first8 & 0x007f007f007f007fULL) | ((first8 & 0x7f007f007f007f00ULL) >> 1);
+    uint64_t step2 = (step1 & 0x00003fff00003fffULL) | ((step1 & 0x3fff00003fff0000ULL) >> 2);
+    uint64_t step3 = (step2 & 0x0fffffffULL) | ((step2 >> 4) & (0x0fffffffULL << 28));
+    uint64_t mask = (len == 8) ? ~0ULL : ((1ULL << (7 * len)) - 1);
+    uint32_t val = static_cast<uint32_t>(step3 & mask);
+#endif
+    return {p + len, val};
   }
-  // Accept >5 bytes
-  for (std::uint32_t i = 5; i < 10; i++) {
-    uint32_t byte = static_cast<uint8_t>(p[i]);
-    if (ABSL_PREDICT_TRUE(byte < 128)) {
-      return {p + i + 1, res};
+
+  // > 8 bytes (9 or 10 bytes) - discard high bits for 32-bit output
+  auto ptr = reinterpret_cast<const uint8_t*>(p);
+  if (ptr[8] < 128) {
+    uint64_t v = 0;
+    for (size_t i = 0, offset = 0; i < 8; i++, offset += 7) {
+      v += static_cast<uint64_t>(ptr[i] - 0x80) << offset;
     }
+    v += static_cast<uint64_t>(ptr[8]) << 56;
+    return {p + 9, static_cast<uint32_t>(v)};
+  } else if (ptr[9] < 128) {
+    uint64_t v = 0;
+    for (size_t i = 0, offset = 0; i < 9; i++, offset += 7) {
+      v += static_cast<uint64_t>(ptr[i] - 0x80) << offset;
+    }
+    v += static_cast<uint64_t>(ptr[9]) << 63;
+    return {p + 10, static_cast<uint32_t>(v)};
   }
   return {nullptr, 0};
 }
 
 std::pair<const char*, uint64_t> VarintParseSlow64(const char* p,
                                                    uint32_t res32) {
-  uint64_t res = res32;
-  for (std::uint32_t i = 1; i < 10; i++) {
-    uint64_t byte = static_cast<uint8_t>(p[i]);
-    res += (byte - 1) << (7 * i);
-    if (ABSL_PREDICT_TRUE(byte < 128)) {
-      return {p + i + 1, res};
+  uint64_t first8;
+  std::memcpy(&first8, p, sizeof(first8));
+
+  uint64_t term_mask = (~first8) & 0x8080808080808080ULL;
+  if (ABSL_PREDICT_TRUE(term_mask != 0)) {
+    int ctz = absl::countr_zero(term_mask);
+    int len = (ctz >> 3) + 1;
+#if defined(__BMI2__)
+    uint64_t payload = _pext_u64(first8, 0x7f7f7f7f7f7f7f7fULL);
+    uint64_t val = _bzhi_u64(payload, 7 * len);
+#else
+    uint64_t step1 = (first8 & 0x007f007f007f007fULL) | ((first8 & 0x7f007f007f007f00ULL) >> 1);
+    uint64_t step2 = (step1 & 0x00003fff00003fffULL) | ((step1 & 0x3fff00003fff0000ULL) >> 2);
+    uint64_t step3 = (step2 & 0x0fffffffULL) | ((step2 >> 4) & (0x0fffffffULL << 28));
+    uint64_t mask = (len == 8) ? ~0ULL : ((1ULL << (7 * len)) - 1);
+    uint64_t val = step3 & mask;
+#endif
+    return {p + len, val};
+  }
+
+  // > 8 bytes (9 or 10 bytes)
+  auto ptr = reinterpret_cast<const uint8_t*>(p);
+  if (ptr[8] < 128) {
+    uint64_t v = 0;
+    for (size_t i = 0, offset = 0; i < 8; i++, offset += 7) {
+      v += static_cast<uint64_t>(ptr[i] - 0x80) << offset;
     }
+    v += static_cast<uint64_t>(ptr[8]) << 56;
+    return {p + 9, v};
+  } else if (ptr[9] < 128) {
+    uint64_t v = 0;
+    for (size_t i = 0, offset = 0; i < 9; i++, offset += 7) {
+      v += static_cast<uint64_t>(ptr[i] - 0x80) << offset;
+    }
+    v += static_cast<uint64_t>(ptr[9]) << 63;
+    return {p + 10, v};
   }
   return {nullptr, 0};
 }
